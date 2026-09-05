@@ -50,6 +50,11 @@
 
   /* typable book combobox */
   .combo{position:relative}
+  .combo input{padding-right:34px}
+  .combo-clear{position:absolute;top:0;right:0;bottom:0;width:34px;display:none;align-items:center;justify-content:center;
+    color:var(--dim);font-size:16px;cursor:pointer}
+  .combo-clear.show{display:flex}
+  .combo-clear:active{color:var(--text)}
   .combo-list{position:absolute;left:0;right:0;top:calc(100% + 4px);max-height:260px;overflow-y:auto;
     background:var(--panel);border:1px solid var(--line);border-radius:10px;z-index:20;
     box-shadow:0 12px 30px rgba(0,0,0,.35);display:none}
@@ -77,6 +82,8 @@
   .stage[data-light="1"] .pill{background:rgba(255,255,255,.65);color:#333;border-color:#ccc}
   .chapterNav{display:flex;align-items:center;gap:6px;overflow-x:auto;-webkit-overflow-scrolling:touch;max-width:100%}
   .topbar-right{display:flex;align-items:center;gap:6px;flex:0 0 auto}
+  .hideToggle{position:absolute;top:8px;right:10px;z-index:6}
+  .stage[data-light="1"] .hideToggle{background:rgba(255,255,255,.65);color:#333;border-color:#ccc}
   .fontRow{justify-content:center;gap:6px;overflow-x:auto;-webkit-overflow-scrolling:touch}
   .fontRow .pill{flex:0 0 auto}
 
@@ -87,7 +94,8 @@
   .stage[data-light="1"] .chapterToast{background:rgba(255,255,255,.88);color:#222;border:1px solid #ccc}
 
   .textDisplay{position:absolute;inset:0;overflow-y:auto;-webkit-overflow-scrolling:touch;
-    padding:70px 6% 26px;z-index:2;display:flex;align-items:center}
+    padding:70px 6% 26px;z-index:2;display:flex;align-items:center;touch-action:pan-y;
+    -webkit-user-select:none;user-select:none}
   .textDisplay .inner{width:100%;margin:auto}
   .blockLabel{text-align:center;font-size:12px;letter-spacing:.6px;text-transform:uppercase;color:var(--dim);margin-bottom:14px}
   .frBlock{font-family:"Linux Libertine","Libertinus Serif",Georgia,serif;
@@ -97,9 +105,6 @@
     font-size:calc(clamp(15px,3.4vw,23px) * var(--mainScale,1));line-height:1.5;text-align:left;color:var(--en);opacity:.9;margin-top:18px;
     padding-left:14px;border-left:3px solid var(--line)}
   .enBlock.speaking{opacity:1}
-
-  .tapzones{position:absolute;inset:0;display:flex;z-index:3;touch-action:manipulation}
-  .tapzones .z{flex:0 0 40%}.tapzones .z.mid{flex:0 0 20%}
 
   .controls{display:flex;flex-direction:column;flex:0 0 auto;transition:opacity .2s,max-height .2s;overflow:hidden}
   .controls.hidden{max-height:0;opacity:0;pointer-events:none}
@@ -151,6 +156,7 @@
     .fontRow{gap:4px}
     .chapterToast{top:40px;font-size:11px;padding:7px 11px}
     .textDisplay{padding:52px 6% 16px}
+    .hideToggle{top:4px;right:6px;padding:5px 8px;font-size:11px}
   }
 </style>
 </head>
@@ -164,6 +170,7 @@
       <label>Book</label>
       <div class="combo">
         <input type="text" id="bookInput" placeholder="Type to search a book…" autocomplete="off">
+        <button type="button" class="combo-clear" id="bookClear" title="Clear book selection">&times;</button>
         <div class="combo-list" id="bookList"></div>
       </div>
     </div>
@@ -223,7 +230,6 @@
           <div class="topbar-right">
             <button class="pill icon" id="infoBtn" title="Current chapter &amp; book">ⓘ</button>
             <button class="pill icon" id="colorBtn" title="Colours">🎨</button>
-            <button class="pill icon" id="hideBtn" title="Hide all controls">⤢</button>
           </div>
         </div>
         <div class="topbar-row fontRow" id="fontRow">
@@ -232,11 +238,9 @@
           <button class="pill" data-act="fontReset" title="Reset text size">&#8635;</button>
         </div>
       </div>
+      <button class="pill icon hideToggle" id="hideBtn" title="Hide all controls">⤢</button>
       <div class="chapterToast" id="chapterToast"></div>
       <div class="textDisplay" id="textDisplay"><div class="inner" id="textInner"></div></div>
-      <div class="tapzones">
-        <div class="z" id="zLeft"></div><div class="z mid" id="zMid"></div><div class="z" id="zRight"></div>
-      </div>
       <div class="cpanel" id="cpanel">
         <h3>Colours</h3>
         <div class="presets" id="presets">
@@ -293,9 +297,10 @@
   var selectedBook=null; // manifest book entry currently chosen in the combobox
 
   var bookInput=$('bookInput'), bookList=$('bookList'), chapSel=$('chapterSelect'),
-      passInput=$('bookPass'), rememberBox=$('bookRemember'), loadBtn=$('loadChapterBtn');
+      bookClear=$('bookClear'), passInput=$('bookPass'), rememberBox=$('bookRemember'), loadBtn=$('loadChapterBtn');
 
   var MAX_LIST=25;
+  function updateClearBtn(){ bookClear.classList.toggle('show', !!bookInput.value); }
   function renderBookList(filter){
     bookList.innerHTML='';
     if(!MANIFEST){ bookList.classList.remove('show'); return; }
@@ -320,8 +325,15 @@
   }
   function chooseBook(b){
     selectedBook=b; bookInput.value=b.title; bookList.classList.remove('show');
-    fillChapters(); updateLoadEnabled();
+    fillChapters(); updateLoadEnabled(); updateClearBtn();
   }
+  function clearBook(){
+    selectedBook=null; bookInput.value='';
+    fillChapters(); updateLoadEnabled(); updateClearBtn();
+    bookList.classList.remove('show');
+    bookInput.focus();
+  }
+  bookClear.addEventListener('click', clearBook);
   function fillChapters(){
     chapSel.innerHTML='';
     if(!selectedBook){ chapSel.disabled=true; return; }
@@ -331,7 +343,7 @@
   function updateLoadEnabled(){ loadBtn.disabled = !selectedBook; }
   bookInput.addEventListener('input',function(){
     if(selectedBook && bookInput.value!==selectedBook.title) selectedBook=null;
-    updateLoadEnabled(); fillChapters();
+    updateLoadEnabled(); fillChapters(); updateClearBtn();
     renderBookList(bookInput.value);
   });
   bookInput.addEventListener('focus',function(){ renderBookList(bookInput.value); });
@@ -536,12 +548,18 @@
     clearTimeout(el._hideTimer); el._hideTimer=setTimeout(function(){ el.classList.remove('show'); },3000);
   }
 
-  /* ========== hide-all-controls (maximize viewing area) ========== */
+  /* ========== hide-all-controls (maximize viewing area) ==========
+     The toggle button itself lives OUTSIDE #topbar (see .hideToggle) so it
+     stays visible and clickable even while hidden — otherwise there'd be no
+     way to bring the controls back. Icon/title flip to make the state and
+     the fact that tapping it reverses it) clear at a glance. */
   var controlsHidden=false;
   function applyHidden(){
     $('topbar').style.opacity = controlsHidden?'0':'1';
     $('topbar').style.pointerEvents = controlsHidden?'none':'auto';
     $('controls').classList.toggle('hidden',controlsHidden);
+    $('hideBtn').textContent = controlsHidden ? '⤡' : '⤢';
+    $('hideBtn').title = controlsHidden ? 'Show all controls' : 'Hide all controls';
   }
   $('hideBtn').onclick=function(){ controlsHidden=!controlsHidden; applyHidden(); };
 
@@ -735,8 +753,15 @@
 
   /* ========== double-tap zones ==========
      Single tap does nothing (so the reading area can be scrolled normally);
-     only a DOUBLE tap/click triggers navigation — right = next block (read,
-     then stop), middle = replay current block, left = previous block. */
+     only a DOUBLE tap/click triggers navigation — right 40% = next block
+     (read, then stop), middle 20% = replay current block (language-aware),
+     left 40% = previous block.
+     This listens directly on #textDisplay (the actual scroll container)
+     rather than a separate overlay div — an overlay on top would intercept
+     wheel/touch events and break native scrolling, since it isn't itself
+     part of #textDisplay's scrollable box. Listening on #textDisplay itself
+     lets normal scroll/wheel pass straight through, and a genuine tap still
+     fires a native 'click' (a scroll/drag gesture does not). */
   var DBL_MS=350;
   function makeDoubleTap(el, fn){
     var lastT=0;
@@ -745,9 +770,19 @@
       if(t-lastT<=DBL_MS){ lastT=0; fn(e); } else { lastT=t; }
     });
   }
-  makeDoubleTap($('zRight'), function(){ nextBlock(); });
-  makeDoubleTap($('zMid'), function(e){ replayBlockSingleLang(langAtY(e.clientY)); });
-  makeDoubleTap($('zLeft'), function(){ prevBlock(); });
+  function zoneAtX(el,x){
+    var r=el.getBoundingClientRect();
+    var frac=(x-r.left)/r.width;
+    if(frac<0.4) return 'left';
+    if(frac>0.6) return 'right';
+    return 'mid';
+  }
+  makeDoubleTap($('textDisplay'), function(e){
+    var zone=zoneAtX($('textDisplay'), e.clientX);
+    if(zone==='right') nextBlock();
+    else if(zone==='left') prevBlock();
+    else replayBlockSingleLang(langAtY(e.clientY));
+  });
 
 })();
 </script>
