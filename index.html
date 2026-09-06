@@ -78,6 +78,10 @@
   .topbar{position:absolute;top:8px;left:0;right:0;display:flex;flex-direction:column;gap:6px;padding:0 54px 0 10px;z-index:5;transition:opacity .2s}
   .topbar-row{display:flex;justify-content:space-between;align-items:center;gap:6px}
   .pill{font-size:12px;color:var(--dim);background:rgba(0,0,0,.35);border:1px solid var(--line);border-radius:8px;padding:6px 11px;white-space:nowrap}
+  /* A hardware/lock-screen control (e.g. a headphone button) shouldn't make
+     any on-screen button visibly light up — belt-and-suspenders alongside
+     the JS blurActive() calls in case a browser still paints a focus ring. */
+  .pill:focus,.langBtn:focus{outline:none}
   .pill.icon{padding:6px 9px;font-size:13px;line-height:1}
   .stage[data-light="1"] .pill{background:rgba(255,255,255,.65);color:#333;border-color:#ccc}
   .chapterNav{display:flex;align-items:center;gap:6px;overflow-x:auto;-webkit-overflow-scrolling:touch;max-width:100%}
@@ -639,11 +643,18 @@
      in try/catch since some of these actions throw in browsers that don't
      support them, and the whole API may simply not exist. */
   if('mediaSession' in navigator){
-    try{ navigator.mediaSession.setActionHandler('play', function(){ if(!playing) play(false); else if(paused) resumeReading(); }); }catch(e){}
-    try{ navigator.mediaSession.setActionHandler('pause', function(){ if(playing && !paused) pauseReading(); }); }catch(e){}
-    try{ navigator.mediaSession.setActionHandler('stop', function(){ stop(); }); }catch(e){}
-    try{ navigator.mediaSession.setActionHandler('previoustrack', function(){ prevBlock(); }); }catch(e){}
-    try{ navigator.mediaSession.setActionHandler('nexttrack', function(){ nextBlock(); }); }catch(e){}
+    try{ navigator.mediaSession.setActionHandler('play', function(){ blurActive(); if(!playing) play(false); else if(paused) resumeReading(); }); }catch(e){}
+    try{ navigator.mediaSession.setActionHandler('pause', function(){ blurActive(); if(playing && !paused) pauseReading(); }); }catch(e){}
+    try{ navigator.mediaSession.setActionHandler('stop', function(){ blurActive(); stop(); }); }catch(e){}
+    try{ navigator.mediaSession.setActionHandler('previoustrack', function(){ blurActive(); prevBlock(); }); }catch(e){}
+    try{ navigator.mediaSession.setActionHandler('nexttrack', function(){ blurActive(); nextBlock(); }); }catch(e){}
+  }
+  // A hardware/headphone/lock-screen control firing shouldn't leave any
+  // on-screen button LOOKING pressed/focused — whatever element happened to
+  // still hold keyboard focus from the person's last on-screen tap gets
+  // blurred before we react, so no focus ring is left "stuck" behind.
+  function blurActive(){
+    try{ var a=document.activeElement; if(a && a!==document.body && typeof a.blur==='function') a.blur(); }catch(e){}
   }
   function updateMediaSessionMetadata(){
     if(!('mediaSession' in navigator) || typeof MediaMetadata==='undefined') return;
@@ -832,21 +843,66 @@
   // `text` starts at — 0 for a fresh chunk, or the pause point when this is
   // a resumed chunk — so segment highlighting stays correct even after a
   // pause/resume mid-paragraph (see pauseReading/resumeReading below).
+  //
+  // Progress through `text` is normally tracked purely from the engine's own
+  // onboundary charIndex — exact, and this is all that's used wherever it's
+  // supported (this is what already worked correctly, e.g. on iOS). Some
+  // engines — notably many Android voices — never fire onboundary at all,
+  // which otherwise silently breaks both mid-sentence pause/resume (it would
+  // always resume from position 0, i.e. the whole language restarts) and the
+  // highlighted-segment display (it would just never move). To fix that
+  // WITHOUT touching engines that already work: a time-based estimate only
+  // switches on after a grace period with zero real onboundary events, and
+  // the moment a single real one arrives, the estimate is retired for good
+  // and every position from then on comes only from real events — so on an
+  // engine that does fire onboundary, this code path is never even reached.
+  var BOUNDARY_GRACE_MS=600;
   function speakChunk(lang, text, onEnd, base){
     base = base||0;
     curLangPlaying=lang;
-    var chunk={ lang:lang, text:text, base:base, boundaryIdx:0, onEnd:onEnd };
+    var chunk={ lang:lang, text:text, base:base, boundaryIdx:0, onEnd:onEnd, startTime:Date.now(), hasRealBoundary:false };
     activeChunk=chunk;
     var u=new SpeechSynthesisUtterance(text);
     applyVoiceSettings(u,lang);
+    var wordCount=text.split(/\s+/).filter(Boolean).length||1;
+    var estDurationMs=Math.max(300, (wordCount/(wpm[lang]||150))*60000);
+    function advanceTo(i){ if(i>chunk.boundaryIdx){ chunk.boundaryIdx=i; updateSegHighlight(lang, base+i); } }
+    var estTimer=setInterval(function(){
+      if(activeChunk!==chunk || chunk.hasRealBoundary){ clearInterval(estTimer); return; } // real events showed up — stand down for good
+      var elapsed=Date.now()-chunk.startTime;
+      if(elapsed<BOUNDARY_GRACE_MS) return; // still giving onboundary a chance to prove it's supported
+      advanceTo(Math.min(text.length, Math.round((elapsed/estDurationMs)*text.length)));
+    }, 150);
     u.onboundary=function(e){
       if(activeChunk!==chunk || typeof e.charIndex!=='number') return;
-      chunk.boundaryIdx=e.charIndex;
-      updateSegHighlight(lang, base+e.charIndex);
+      chunk.hasRealBoundary=true;
+      advanceTo(e.charIndex);
     };
-    function finish(){ if(activeChunk!==chunk) return; activeChunk=null; curLangPlaying=null; clearSegHighlight(); onEnd(); }
+    function finish(){ if(activeChunk!==chunk) return; clearInterval(estTimer); activeChunk=null; curLangPlaying=null; clearSegHighlight(); onEnd(); }
     u.onend=finish; u.onerror=finish;
     window.speechSynthesis.speak(u);
+  }
+  // Wraps speakChunk with a one-time retry: if, ~450ms in, our chunk is
+  // STILL the active one (i.e. it hasn't finished — trivially-short chunks
+  // that legitimately completed already are excluded by this check) yet the
+  // engine reports nothing is actually speaking, that's the signature of a
+  // known WebKit/iOS bug where calling speak() right after cancel() (exactly
+  // what resuming from a pause does) silently produces no audio. Re-issuing
+  // it once, from a clean cancel(), reliably recovers it. Deliberately used
+  // ONLY for resuming (see resumeReading) — normal sequential block-to-block
+  // speech was already working fine everywhere, including iOS, so it's left
+  // on the plain speakChunk path rather than adding this check to it too.
+  function speakChunkWithRetry(lang, text, onEnd, base){
+    speakChunk(lang, text, onEnd, base);
+    setTimeout(function(){
+      if(!hasTTS || !activeChunk || activeChunk.lang!==lang || activeChunk.text!==text) return;
+      try{
+        if(!window.speechSynthesis.speaking){
+          window.speechSynthesis.cancel();
+          speakChunk(lang, text, onEnd, base);
+        }
+      }catch(e){}
+    }, 450);
   }
 
   function loadBlocks(list){
@@ -1006,7 +1062,7 @@
     paused=false;
     var pr=pausedResume; pausedResume=null;
     if(pr){
-      if(pr.type==='tts') speakChunk(pr.lang, pr.text, pr.onEnd, pr.base);
+      if(pr.type==='tts') speakChunkWithRetry(pr.lang, pr.text, pr.onEnd, pr.base);
       else if(pr.type==='timer') startFallbackTimer(pr.ms, pr.onEnd);
     } else {
       runCurrentBlock(); // nothing was mid-flight (e.g. paused between blocks) — just continue normally
@@ -1070,11 +1126,11 @@
     else if(e.code==='ArrowLeft')prevBlock(); else if(e.code==='ArrowRight')nextBlock();
     // Wired-headphone / keyboard media keys (desktop OSes surface a headset's
     // inline remote as these standard media-key codes when the tab is focused).
-    else if(e.code==='MediaPlayPause'){ e.preventDefault(); toggle(); }
-    else if(e.code==='MediaPlay'){ e.preventDefault(); if(!playing) play(false); else if(paused) resumeReading(); }
-    else if(e.code==='MediaPause'){ e.preventDefault(); if(playing && !paused) pauseReading(); }
-    else if(e.code==='MediaTrackNext'){ e.preventDefault(); nextBlock(); }
-    else if(e.code==='MediaTrackPrevious'){ e.preventDefault(); prevBlock(); } });
+    else if(e.code==='MediaPlayPause'){ e.preventDefault(); blurActive(); toggle(); }
+    else if(e.code==='MediaPlay'){ e.preventDefault(); blurActive(); if(!playing) play(false); else if(paused) resumeReading(); }
+    else if(e.code==='MediaPause'){ e.preventDefault(); blurActive(); if(playing && !paused) pauseReading(); }
+    else if(e.code==='MediaTrackNext'){ e.preventDefault(); blurActive(); nextBlock(); }
+    else if(e.code==='MediaTrackPrevious'){ e.preventDefault(); blurActive(); prevBlock(); } });
 
   /* ========== double-tap zones ==========
      Single tap does nothing (so the reading area can be scrolled normally);
