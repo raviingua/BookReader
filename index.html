@@ -314,7 +314,6 @@
   var bookInput=$('bookInput'), bookList=$('bookList'), chapSel=$('chapterSelect'),
       bookClear=$('bookClear'), passInput=$('bookPass'), rememberBox=$('bookRemember'), loadBtn=$('loadChapterBtn');
 
-  var MAX_LIST=25;
   function updateClearBtn(){ bookClear.classList.toggle('show', !!bookInput.value); }
   function renderBookList(filter){
     bookList.innerHTML='';
@@ -325,16 +324,14 @@
       var e=document.createElement('div'); e.className='empty'; e.textContent='No matching books.';
       bookList.appendChild(e);
     } else {
-      matches.slice(0,MAX_LIST).forEach(function(b){
+      // Every match is shown — the list itself scrolls (max-height + overflow-y),
+      // so nothing is hidden; typing still narrows it down, it just no longer
+      // truncates the results.
+      matches.forEach(function(b){
         var o=document.createElement('div'); o.className='opt'; o.textContent=b.title;
         o.addEventListener('click',function(){ chooseBook(b); });
         bookList.appendChild(o);
       });
-      if(matches.length>MAX_LIST){
-        var m=document.createElement('div'); m.className='more';
-        m.textContent=(matches.length-MAX_LIST)+' more — keep typing to narrow it down';
-        bookList.appendChild(m);
-      }
     }
     bookList.classList.add('show');
   }
