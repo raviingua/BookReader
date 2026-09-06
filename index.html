@@ -111,10 +111,14 @@
     font-size:calc(clamp(19px,4.6vw,32px) * var(--mainScale,1));line-height:1.55;text-align:left;
     font-style:normal;color:#000}
   .enBlock{background:#f7f7f7;border:1px solid #ddd;border-radius:6px;padding:0.6em 0.9em}
-  .stage[data-hl="underline"] .frBlock.speaking,.stage[data-hl="underline"] .enBlock.speaking{
+  /* Individual sentence/line spans (wrapped in at render time — see
+     applySentenceSpans in the script). Invisible by default; only the ONE
+     currently-speaking segment gets styled, via the highlight-mode button. */
+  .ttsSeg{}
+  .stage[data-hl="underline"] .ttsSeg.speaking{
     text-decoration:underline;text-decoration-thickness:2px;text-underline-offset:4px}
-  .stage[data-hl="highlight"] .frBlock.speaking{background:#d8d8d8}
-  .stage[data-hl="highlight"] .enBlock.speaking{background:#cfcfcf;border-color:#bbb}
+  .stage[data-hl="highlight"] .ttsSeg.speaking{background:#d8d8d8;border-radius:3px}
+  .stage[data-hl="highlight"] .enBlock .ttsSeg.speaking{background:#cfcfcf}
 
   .controls{display:flex;flex-direction:column;flex:0 0 auto;transition:opacity .2s,max-height .2s;overflow:hidden}
   .controls.hidden{max-height:0;opacity:0;pointer-events:none}
@@ -729,14 +733,118 @@
   var paused=false, activeChunk=null, pausedResume=null;
   var fallbackTimer=null, fallbackDeadline=null;
 
-  function speakChunk(lang, text, onEnd){
-    curLangPlaying=lang; highlightLang(lang);
-    var chunk={ lang:lang, text:text, boundaryIdx:0, onEnd:onEnd };
+  /* ---- sentence/line segmentation, for highlighting only the part being
+     spoken instead of the whole paragraph ----
+     Walks the rendered French/English <div> after its HTML is set, and:
+       1. Reconstructs the exact plain text it represents (text nodes as-is,
+          each <br> counted as one space) — this becomes the text actually
+          given to the speech engine, so word-boundary offsets line up
+          perfectly with the segments below by construction.
+       2. Finds segment boundaries: sentence-ending punctuation (. ! ? …)
+          and every <br> (so a "line" — e.g. each answer option in a
+          Question block — is its own segment even with no punctuation).
+       3. Splits the underlying DOM text nodes at those boundaries (plain
+          Text.splitText — a standard, universally-supported DOM method) and
+          wraps each resulting run in a <span class="ttsSeg" data-seg="i">.
+          A segment that crosses a <strong>/<em> boundary just gets two (or
+          more) spans sharing the same data-seg — visually identical to one
+          span, and every one of them lights up together when highlighted. */
+  function extractPlainAndMap(el){
+    var text='', brOffsets=[];
+    (function walk(node){
+      var kids=node.childNodes;
+      for(var i=0;i<kids.length;i++){
+        var c=kids[i];
+        if(c.nodeType===3){ if(c.nodeValue) text+=c.nodeValue; }
+        else if(c.nodeType===1){
+          if(c.tagName==='BR'){ brOffsets.push(text.length); text+=' '; }
+          else walk(c);
+        }
+      }
+    })(el);
+    return { text:text, brOffsets:brOffsets };
+  }
+  function computeBoundaries(text, brOffsets){
+    var bset={}; bset[0]=1; bset[text.length]=1;
+    var re=/[.!?\u2026]+(?:["'\u201d\u2019)\]]*)(?=\s|$)/g, m;
+    while((m=re.exec(text))){ bset[m.index+m[0].length]=1; }
+    brOffsets.forEach(function(o){ bset[o]=1; });
+    var arr=Object.keys(bset).map(Number).sort(function(a,b){return a-b;});
+    var out=[arr[0]];
+    for(var i=1;i<arr.length;i++){ if(arr[i]>out[out.length-1]) out.push(arr[i]); }
+    return out;
+  }
+  function applySentenceSpans(el){
+    var extracted=extractPlainAndMap(el);
+    if(!extracted.text.trim()) return { text:extracted.text, boundaries:[0,extracted.text.length] };
+    var bpoints=computeBoundaries(extracted.text, extracted.brOffsets);
+    var offset=0, segIdx=0;
+    function segIdxFor(pos){ while(segIdx+1<bpoints.length && bpoints[segIdx+1]<=pos) segIdx++; return segIdx; }
+    (function walk(node){
+      var kids=Array.prototype.slice.call(node.childNodes);
+      kids.forEach(function(c){
+        if(c.nodeType===3){
+          var t=c.nodeValue; if(!t) return;
+          var nodeStart=offset;
+          var interior=bpoints.filter(function(p){ return p>nodeStart && p<nodeStart+t.length; });
+          var cur=c, curStart=nodeStart;
+          interior.forEach(function(p){ var rest=cur.splitText(p-curStart); curStart=p; cur=rest; });
+          var node2=c, consumed=0;
+          while(node2 && node2.nodeType===3 && consumed<t.length){
+            var len2=node2.nodeValue.length;
+            var idx=segIdxFor(offset+consumed);
+            var span=document.createElement('span'); span.className='ttsSeg'; span.setAttribute('data-seg',idx);
+            var nextSib=node2.nextSibling;
+            node2.parentNode.insertBefore(span,node2); span.appendChild(node2);
+            consumed+=len2; node2=nextSib;
+          }
+          offset+=t.length;
+        } else if(c.nodeType===1){
+          if(c.tagName==='BR'){ segIdxFor(offset); offset+=1; }
+          else walk(c);
+        }
+      });
+    })(el);
+    return { text:extracted.text, boundaries:bpoints };
+  }
+  function segIndexForOffset(boundaries, pos){
+    for(var i=0;i<boundaries.length-1;i++){ if(pos>=boundaries[i] && pos<boundaries[i+1]) return i; }
+    return Math.max(0, boundaries.length-2);
+  }
+  var frSeg=null, enSeg=null; // {text, boundaries} for the currently-rendered block, set in renderBlock()
+  function updateSegHighlight(lang, absoluteCharIdx){
+    var seg = lang==='fr' ? frSeg : enSeg;
+    var el = $(lang==='fr' ? 'frBlockEl' : 'enBlockEl');
+    if(!seg || !el) return;
+    var idx = segIndexForOffset(seg.boundaries, absoluteCharIdx);
+    var spans=el.querySelectorAll('.ttsSeg');
+    for(var i=0;i<spans.length;i++) spans[i].classList.toggle('speaking', spans[i].getAttribute('data-seg')===String(idx));
+  }
+  function clearSegHighlight(){
+    ['frBlockEl','enBlockEl'].forEach(function(id){
+      var el=$(id); if(!el) return;
+      var spans=el.querySelectorAll('.ttsSeg.speaking');
+      for(var i=0;i<spans.length;i++) spans[i].classList.remove('speaking');
+    });
+  }
+
+  // `base` is the absolute offset (into the full frSeg/enSeg text) that
+  // `text` starts at — 0 for a fresh chunk, or the pause point when this is
+  // a resumed chunk — so segment highlighting stays correct even after a
+  // pause/resume mid-paragraph (see pauseReading/resumeReading below).
+  function speakChunk(lang, text, onEnd, base){
+    base = base||0;
+    curLangPlaying=lang;
+    var chunk={ lang:lang, text:text, base:base, boundaryIdx:0, onEnd:onEnd };
     activeChunk=chunk;
     var u=new SpeechSynthesisUtterance(text);
     applyVoiceSettings(u,lang);
-    u.onboundary=function(e){ if(activeChunk===chunk && typeof e.charIndex==='number') chunk.boundaryIdx=e.charIndex; };
-    function finish(){ if(activeChunk!==chunk) return; activeChunk=null; curLangPlaying=null; highlightLang(null); onEnd(); }
+    u.onboundary=function(e){
+      if(activeChunk!==chunk || typeof e.charIndex!=='number') return;
+      chunk.boundaryIdx=e.charIndex;
+      updateSegHighlight(lang, base+e.charIndex);
+    };
+    function finish(){ if(activeChunk!==chunk) return; activeChunk=null; curLangPlaying=null; clearSegHighlight(); onEnd(); }
     u.onend=finish; u.onerror=finish;
     window.speechSynthesis.speak(u);
   }
@@ -752,23 +860,20 @@
   function renderBlock(){
     var inner=$('textInner'); inner.innerHTML='';
     var b=blocks[idx];
-    if(!b){ $('pos').textContent=0; $('total').textContent=0; $('playBtn').textContent='\u25b6'; return; }
+    if(!b){ $('pos').textContent=0; $('total').textContent=0; $('playBtn').textContent='\u25b6'; frSeg=null; enSeg=null; return; }
     if(b.label){ var lab=document.createElement('div'); lab.className='blockLabel'; lab.textContent=b.label; inner.appendChild(lab); }
     var fr=document.createElement('div'); fr.className='frBlock'; fr.id='frBlockEl'; fr.innerHTML=b.fr||'';
     var en=document.createElement('div'); en.className='enBlock'; en.id='enBlockEl'; en.innerHTML=b.en||'';
     if(langOrder==='en'){ inner.appendChild(en); inner.appendChild(fr); }
     else { inner.appendChild(fr); inner.appendChild(en); }
-    highlightLang(curLangPlaying);
+    frSeg=applySentenceSpans(fr);
+    enSeg=applySentenceSpans(en);
     $('pos').textContent=blocks.length?idx+1:0;
     $('total').textContent=blocks.length;
     $('playBtn').textContent=(playing && !paused)?'\u275a\u275a':'\u25b6';
     $('textDisplay').scrollTop=0;
   }
-  function highlightLang(lang){
-    var fr=$('frBlockEl'), en=$('enBlockEl');
-    if(fr) fr.classList.toggle('speaking', lang==='fr');
-    if(en) en.classList.toggle('speaking', lang==='en');
-  }
+  function updatePlayBtnIcon(){ $('playBtn').textContent=(playing && !paused)?'\u275a\u275a':'\u25b6'; }
 
   function applyVoiceSettings(u,t){
     var selId = t==='fr' ? 'voiceSelectFR' : 'voiceSelectEN';
@@ -787,6 +892,10 @@
   // when hasTTS is true — the no-speech-engine fallback is a timed loop
   // instead (see runCurrentBlock), so `done` here is always reached
   // asynchronously via a real utterance's onend/onerror, never recursively.
+  // Speaks frSeg.text/enSeg.text (built by applySentenceSpans during the
+  // last renderBlock) rather than the pre-baked b.frText/b.enText — that's
+  // the exact text the on-screen <span> segments were split from, so the
+  // speech engine's word-boundary offsets line up with them exactly.
   function speakBlockPair(b, done){
     var order = langOrder==='en' ? ['en','fr'] : ['fr','en'];
     var i=0;
@@ -794,9 +903,10 @@
       if(!playing || paused){ return; } // a pause captures its own resume point; don't keep advancing
       if(i>=order.length){ done(); return; }
       var lang=order[i++];
-      var text=(lang==='fr' ? (b.frText||'') : (b.enText||'')).trim();
-      if(!langEnabled[lang] || !text){ next(); return; }
-      speakChunk(lang, text, next);
+      var seg = lang==='fr' ? frSeg : enSeg;
+      var text = seg ? seg.text : (lang==='fr' ? (b.frText||'') : (b.enText||''));
+      if(!langEnabled[lang] || !text || !text.trim()){ next(); return; }
+      speakChunk(lang, text, next, 0);
     }
     next();
   }
@@ -805,9 +915,10 @@
   // read toggles (this is an explicit single-language request from a
   // middle-zone double-tap, not the general "what to read" setting).
   function speakSingleLang(b, lang, done){
-    var text=(lang==='fr' ? (b.frText||'') : (b.enText||'')).trim();
-    if(!text){ done(); return; }
-    speakChunk(lang, text, done);
+    var seg = lang==='fr' ? frSeg : enSeg;
+    var text = seg ? seg.text : (lang==='fr' ? (b.frText||'') : (b.enText||''));
+    if(!text || !text.trim()){ done(); return; }
+    speakChunk(lang, text, done, 0);
   }
 
   function play(singleBlockOnly){
@@ -862,27 +973,32 @@
     playing=false; paused=false; pausedResume=null; activeChunk=null; curLangPlaying=null;
     clearTimeout(fallbackTimer); fallbackDeadline=null;
     if(hasTTS){ try{ window.speechSynthesis.cancel(); }catch(e){} }
+    clearSegHighlight();
     renderBlock();
     onPlaybackStateChanged();
   }
   // Pause at the EXACT spot — mid-word-boundary for real TTS (see
   // speakChunk), or mid-countdown for the no-speech-engine timed fallback —
-  // and resume picks up right there rather than restarting the block.
+  // and resume picks up right there rather than restarting the block. Only
+  // updates the play/pause icon (not a full renderBlock) so an in-progress
+  // scroll position isn't reset out from under the person mid-pause.
   function pauseReading(){
     if(!playing || paused) return;
     paused=true;
     if(hasTTS && activeChunk){
       var chunk=activeChunk; activeChunk=null;
-      var remain=chunk.text.slice(chunk.boundaryIdx||0).trim();
-      pausedResume={ type:'tts', lang:chunk.lang, text: remain || chunk.text, onEnd:chunk.onEnd };
+      var sliceStart=chunk.boundaryIdx||0;
+      var remain=chunk.text.slice(sliceStart);
+      if(!remain){ remain=chunk.text; sliceStart=0; } // paused right at/after the end — just replay it on resume
+      pausedResume={ type:'tts', lang:chunk.lang, text:remain, base:chunk.base+sliceStart, onEnd:chunk.onEnd };
       try{ window.speechSynthesis.cancel(); }catch(e){}
-      curLangPlaying=null; highlightLang(null);
+      curLangPlaying=null; clearSegHighlight();
     } else if(fallbackDeadline!=null){
       var remainMs=Math.max(0, fallbackDeadline-Date.now());
       clearTimeout(fallbackTimer); fallbackDeadline=null;
       pausedResume={ type:'timer', ms:remainMs, onEnd: advanceOrStop };
     }
-    renderBlock();
+    updatePlayBtnIcon();
     onPlaybackStateChanged();
   }
   function resumeReading(){
@@ -890,12 +1006,12 @@
     paused=false;
     var pr=pausedResume; pausedResume=null;
     if(pr){
-      if(pr.type==='tts') speakChunk(pr.lang, pr.text, pr.onEnd);
+      if(pr.type==='tts') speakChunk(pr.lang, pr.text, pr.onEnd, pr.base);
       else if(pr.type==='timer') startFallbackTimer(pr.ms, pr.onEnd);
     } else {
       runCurrentBlock(); // nothing was mid-flight (e.g. paused between blocks) — just continue normally
     }
-    renderBlock();
+    updatePlayBtnIcon();
     onPlaybackStateChanged();
   }
   function toggle(){
