@@ -399,6 +399,7 @@
     currentBook=b; currentChapterIdx=ci; updateChapterNavUI();
     $('err').textContent='';
     loadBlocks(c.blocks);
+    updateMediaSessionMetadata();
   }
   function loadChapterByIndex(b,ci){
     if(!b)return;
@@ -626,10 +627,119 @@
   });
   applyOrderBtn();
 
+  /* ========== headphone / lock-screen media controls ==========
+     Media Session API: gives the OS a "now playing" surface (lock screen,
+     notification shade, Bluetooth/wired headset remote) that routes its
+     play/pause/next/previous controls back into this page — this is what
+     lets a wired headphone's inline button pause/resume playback. Wrapped
+     in try/catch since some of these actions throw in browsers that don't
+     support them, and the whole API may simply not exist. */
+  if('mediaSession' in navigator){
+    try{ navigator.mediaSession.setActionHandler('play', function(){ if(!playing) play(false); else if(paused) resumeReading(); }); }catch(e){}
+    try{ navigator.mediaSession.setActionHandler('pause', function(){ if(playing && !paused) pauseReading(); }); }catch(e){}
+    try{ navigator.mediaSession.setActionHandler('stop', function(){ stop(); }); }catch(e){}
+    try{ navigator.mediaSession.setActionHandler('previoustrack', function(){ prevBlock(); }); }catch(e){}
+    try{ navigator.mediaSession.setActionHandler('nexttrack', function(){ nextBlock(); }); }catch(e){}
+  }
+  function updateMediaSessionMetadata(){
+    if(!('mediaSession' in navigator) || typeof MediaMetadata==='undefined') return;
+    try{
+      var chTitle=(currentBook && currentBook.chapters && currentBook.chapters[currentChapterIdx]) || '';
+      var bkTitle=currentBook ? currentBook.title : 'Book Reader';
+      navigator.mediaSession.metadata=new MediaMetadata({ title: chTitle||bkTitle, artist: chTitle?bkTitle:'', album:'Book Reader' });
+    }catch(e){}
+  }
+  function updateMediaSessionPlaybackState(){
+    if(!('mediaSession' in navigator)) return;
+    try{ navigator.mediaSession.playbackState = !playing ? 'none' : (paused ? 'paused' : 'playing'); }catch(e){}
+  }
+
+  /* ========== keep going in the background / while the screen is locked ==========
+     Two best-effort techniques, since a plain web page has no guaranteed way
+     to keep running once the screen locks — this covers it as well as the
+     platform allows:
+       1. Screen Wake Lock — keeps the screen from auto-sleeping/locking
+          while actively reading, so it simply never gets backgrounded in
+          the first place. (Released automatically by the browser once the
+          tab IS hidden, e.g. after a manual power-button lock — Wake Lock
+          can only prevent that, not undo it.)
+       2. A real, near-silent, looping <audio> element. Browsers exempt tabs
+          that are actively playing audio from most background throttling/
+          suspension, which in practice is what keeps speechSynthesis
+          callbacks (onend/onboundary) still firing while backgrounded —
+          pure speechSynthesis with no real <audio> playback has no such
+          exemption and tends to get suspended.
+     Chrome on Android generally honors both well. iOS Safari is much more
+     restrictive about background tabs regardless — expect it to stop once
+     truly locked there. */
+  var wakeLock=null;
+  function requestWakeLock(){
+    if(!('wakeLock' in navigator)) return;
+    navigator.wakeLock.request('screen').then(function(wl){
+      wakeLock=wl;
+      wakeLock.addEventListener('release', function(){ wakeLock=null; });
+    }).catch(function(){ /* not available right now (e.g. tab not visible yet) — fine, silent */ });
+  }
+  function releaseWakeLock(){ if(wakeLock){ try{ wakeLock.release(); }catch(e){} wakeLock=null; } }
+  document.addEventListener('visibilitychange', function(){
+    if(document.visibilityState==='visible' && playing && !paused && !wakeLock) requestWakeLock();
+  });
+
+  var silentAudioEl=null;
+  function ensureSilentAudio(){
+    if(silentAudioEl) return silentAudioEl;
+    var a=document.createElement('audio');
+    // a ~0.1s silent WAV, looped
+    a.src='data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=';
+    a.loop=true; a.volume=0.01; a.setAttribute('playsinline','');
+    a.style.display='none';
+    document.body.appendChild(a);
+    silentAudioEl=a;
+    return a;
+  }
+  function startSilentAudio(){ try{ ensureSilentAudio().play().catch(function(){}); }catch(e){} }
+  function stopSilentAudio(){ if(silentAudioEl){ try{ silentAudioEl.pause(); }catch(e){} } }
+
+  // Central hook called by play()/pauseReading()/resumeReading()/stop() so
+  // media-session state, the wake lock, and the keep-alive audio all stay
+  // in sync with actual playback state without repeating this in each of them.
+  function onPlaybackStateChanged(){
+    updateMediaSessionPlaybackState();
+    if(playing && !paused){ requestWakeLock(); startSilentAudio(); }
+    else { stopSilentAudio(); if(!playing) releaseWakeLock(); }
+  }
+
   /* ========== block player ========== */
   var blocks=[], idx=0, playing=false;
   var playMode='continue'; // 'single' = read the target block only, then stop
   var curLangPlaying=null; // 'fr' | 'en' | null — which half of the current block is being spoken
+
+  // ---- pause/resume-at-exact-position state ----
+  // `activeChunk` describes whatever SpeechSynthesisUtterance is on-air right
+  // now: which language, the exact text it was given, the onEnd callback the
+  // surrounding order/repeat logic is waiting on, and the last word-boundary
+  // offset reached inside that text (from the utterance's own onboundary
+  // event — most engines fire this per word). Pausing slices the remaining
+  // text at that offset and remembers it in `pausedResume`; resuming just
+  // speaks that remaining text and, crucially, re-uses the SAME onEnd
+  // callback, so the rest of the block/repeat/order chain continues exactly
+  // as if nothing happened. If a voice never fires onboundary, the offset
+  // stays 0 and resume just restarts that language from its own start —
+  // still better than losing the whole block.
+  var paused=false, activeChunk=null, pausedResume=null;
+  var fallbackTimer=null, fallbackDeadline=null;
+
+  function speakChunk(lang, text, onEnd){
+    curLangPlaying=lang; highlightLang(lang);
+    var chunk={ lang:lang, text:text, boundaryIdx:0, onEnd:onEnd };
+    activeChunk=chunk;
+    var u=new SpeechSynthesisUtterance(text);
+    applyVoiceSettings(u,lang);
+    u.onboundary=function(e){ if(activeChunk===chunk && typeof e.charIndex==='number') chunk.boundaryIdx=e.charIndex; };
+    function finish(){ if(activeChunk!==chunk) return; activeChunk=null; curLangPlaying=null; highlightLang(null); onEnd(); }
+    u.onend=finish; u.onerror=finish;
+    window.speechSynthesis.speak(u);
+  }
 
   function loadBlocks(list){
     stop();
@@ -651,7 +761,7 @@
     highlightLang(curLangPlaying);
     $('pos').textContent=blocks.length?idx+1:0;
     $('total').textContent=blocks.length;
-    $('playBtn').textContent=playing?'\u275a\u275a':'\u25b6';
+    $('playBtn').textContent=(playing && !paused)?'\u275a\u275a':'\u25b6';
     $('textDisplay').scrollTop=0;
   }
   function highlightLang(lang){
@@ -678,20 +788,15 @@
   // instead (see runCurrentBlock), so `done` here is always reached
   // asynchronously via a real utterance's onend/onerror, never recursively.
   function speakBlockPair(b, done){
-    window.speechSynthesis.cancel();
     var order = langOrder==='en' ? ['en','fr'] : ['fr','en'];
     var i=0;
     function next(){
-      if(!playing){ done(); return; }
-      if(i>=order.length){ curLangPlaying=null; highlightLang(null); done(); return; }
+      if(!playing || paused){ return; } // a pause captures its own resume point; don't keep advancing
+      if(i>=order.length){ done(); return; }
       var lang=order[i++];
       var text=(lang==='fr' ? (b.frText||'') : (b.enText||'')).trim();
       if(!langEnabled[lang] || !text){ next(); return; }
-      curLangPlaying=lang; highlightLang(lang);
-      var u=new SpeechSynthesisUtterance(text);
-      applyVoiceSettings(u,lang);
-      u.onend=next; u.onerror=next;
-      window.speechSynthesis.speak(u);
+      speakChunk(lang, text, next);
     }
     next();
   }
@@ -700,28 +805,22 @@
   // read toggles (this is an explicit single-language request from a
   // middle-zone double-tap, not the general "what to read" setting).
   function speakSingleLang(b, lang, done){
-    window.speechSynthesis.cancel();
     var text=(lang==='fr' ? (b.frText||'') : (b.enText||'')).trim();
-    if(!text){ curLangPlaying=null; highlightLang(null); done(); return; }
-    curLangPlaying=lang; highlightLang(lang);
-    var u=new SpeechSynthesisUtterance(text);
-    applyVoiceSettings(u,lang);
-    u.onend=function(){ curLangPlaying=null; highlightLang(null); done(); };
-    u.onerror=function(){ curLangPlaying=null; highlightLang(null); done(); };
-    window.speechSynthesis.speak(u);
+    if(!text){ done(); return; }
+    speakChunk(lang, text, done);
   }
 
   function play(singleBlockOnly){
     if(!blocks.length)return;
     if(idx>=blocks.length)idx=0;
-    playing=true;
+    playing=true; paused=false; pausedResume=null;
     playMode = singleBlockOnly ? 'single' : 'continue';
     renderBlock();
+    onPlaybackStateChanged();
     runCurrentBlock();
   }
-  var fallbackTimer=null;
   function advanceOrStop(){
-    if(!playing)return;
+    if(!playing || paused)return;
     if(playMode==='single'){ stop(); return; }
     if(idx+1>=blocks.length){ stop(); return; }
     idx++; renderBlock(); runCurrentBlock();
@@ -734,7 +833,7 @@
     var timesLeft=repeatCount;
     function again(){
       speakOnce(function(){
-        if(!playing){ done(); return; }
+        if(!playing || paused){ return; }
         if(timesLeft>0){ timesLeft--; again(); } else { done(); }
       });
     }
@@ -748,23 +847,62 @@
     var avgWpm=((wpm.fr+wpm.en)/2)||150;
     return Math.max(800, words/avgWpm*60000) * (repeatCount+1);
   }
+  function startFallbackTimer(ms, onEnd){
+    clearTimeout(fallbackTimer);
+    fallbackDeadline=Date.now()+ms;
+    fallbackTimer=setTimeout(function(){ fallbackDeadline=null; onEnd(); }, ms);
+  }
   function runCurrentBlock(){
     if(!playing)return;
     var b=blocks[idx]; if(!b){ stop(); return; }
-    if(!hasTTS){
-      clearTimeout(fallbackTimer);
-      fallbackTimer=setTimeout(advanceOrStop, durationForBlock(b));
-      return;
-    }
+    if(!hasTTS){ startFallbackTimer(durationForBlock(b), advanceOrStop); return; }
     speakWithRepeats(function(cb){ speakBlockPair(b, cb); }, advanceOrStop);
   }
   function stop(){
-    playing=false; curLangPlaying=null;
-    clearTimeout(fallbackTimer);
+    playing=false; paused=false; pausedResume=null; activeChunk=null; curLangPlaying=null;
+    clearTimeout(fallbackTimer); fallbackDeadline=null;
     if(hasTTS){ try{ window.speechSynthesis.cancel(); }catch(e){} }
     renderBlock();
+    onPlaybackStateChanged();
   }
-  function toggle(){ playing?stop():play(false); }
+  // Pause at the EXACT spot — mid-word-boundary for real TTS (see
+  // speakChunk), or mid-countdown for the no-speech-engine timed fallback —
+  // and resume picks up right there rather than restarting the block.
+  function pauseReading(){
+    if(!playing || paused) return;
+    paused=true;
+    if(hasTTS && activeChunk){
+      var chunk=activeChunk; activeChunk=null;
+      var remain=chunk.text.slice(chunk.boundaryIdx||0).trim();
+      pausedResume={ type:'tts', lang:chunk.lang, text: remain || chunk.text, onEnd:chunk.onEnd };
+      try{ window.speechSynthesis.cancel(); }catch(e){}
+      curLangPlaying=null; highlightLang(null);
+    } else if(fallbackDeadline!=null){
+      var remainMs=Math.max(0, fallbackDeadline-Date.now());
+      clearTimeout(fallbackTimer); fallbackDeadline=null;
+      pausedResume={ type:'timer', ms:remainMs, onEnd: advanceOrStop };
+    }
+    renderBlock();
+    onPlaybackStateChanged();
+  }
+  function resumeReading(){
+    if(!playing || !paused) return;
+    paused=false;
+    var pr=pausedResume; pausedResume=null;
+    if(pr){
+      if(pr.type==='tts') speakChunk(pr.lang, pr.text, pr.onEnd);
+      else if(pr.type==='timer') startFallbackTimer(pr.ms, pr.onEnd);
+    } else {
+      runCurrentBlock(); // nothing was mid-flight (e.g. paused between blocks) — just continue normally
+    }
+    renderBlock();
+    onPlaybackStateChanged();
+  }
+  function toggle(){
+    if(!playing){ play(false); }
+    else if(paused){ resumeReading(); }
+    else { pauseReading(); }
+  }
   function gotoBlock(target, playIt){
     stop();
     idx=Math.max(0,Math.min(target,blocks.length-1));
@@ -782,7 +920,7 @@
   function runCurrentBlockSingleLang(lang){
     if(!playing)return;
     var b=blocks[idx]; if(!b){ stop(); return; }
-    if(!hasTTS){ clearTimeout(fallbackTimer); fallbackTimer=setTimeout(advanceOrStop, durationForBlock(b)); return; }
+    if(!hasTTS){ startFallbackTimer(durationForBlock(b), advanceOrStop); return; }
     speakWithRepeats(function(cb){ speakSingleLang(b, lang, cb); }, advanceOrStop);
   }
   function replayBlockSingleLang(lang){
@@ -813,7 +951,14 @@
   document.addEventListener('click',function(e){ var el=e.target.closest('[data-act]'); if(el&&actions[el.dataset.act])actions[el.dataset.act](); });
   document.addEventListener('keydown',function(e){ if(!$('reader').classList.contains('on'))return;
     if(e.code==='Space'){e.preventDefault();toggle();}
-    else if(e.code==='ArrowLeft')prevBlock(); else if(e.code==='ArrowRight')nextBlock(); });
+    else if(e.code==='ArrowLeft')prevBlock(); else if(e.code==='ArrowRight')nextBlock();
+    // Wired-headphone / keyboard media keys (desktop OSes surface a headset's
+    // inline remote as these standard media-key codes when the tab is focused).
+    else if(e.code==='MediaPlayPause'){ e.preventDefault(); toggle(); }
+    else if(e.code==='MediaPlay'){ e.preventDefault(); if(!playing) play(false); else if(paused) resumeReading(); }
+    else if(e.code==='MediaPause'){ e.preventDefault(); if(playing && !paused) pauseReading(); }
+    else if(e.code==='MediaTrackNext'){ e.preventDefault(); nextBlock(); }
+    else if(e.code==='MediaTrackPrevious'){ e.preventDefault(); prevBlock(); } });
 
   /* ========== double-tap zones ==========
      Single tap does nothing (so the reading area can be scrolled normally);
