@@ -857,6 +857,16 @@
   // and every position from then on comes only from real events — so on an
   // engine that does fire onboundary, this code path is never even reached.
   var BOUNDARY_GRACE_MS=600;
+  // The fallback time-estimate (used only when an engine never fires real
+  // onboundary events — in practice, mostly Android) was found to run a bit
+  // AHEAD of the real audio, jumping the highlight to the next sentence
+  // before that sentence had actually finished playing. Treating the block
+  // as if it takes this much longer than the nominal wpm implies slows the
+  // estimate down to better match reality. This constant is only read
+  // inside the estimate-timer branch below — engines that DO report real
+  // onboundary positions (e.g. iOS) never execute that branch at all, so
+  // this has zero effect there.
+  var ANDROID_ESTIMATE_SLOWDOWN=1.35;
   function speakChunk(lang, text, onEnd, base){
     base = base||0;
     curLangPlaying=lang;
@@ -865,7 +875,7 @@
     var u=new SpeechSynthesisUtterance(text);
     applyVoiceSettings(u,lang);
     var wordCount=text.split(/\s+/).filter(Boolean).length||1;
-    var estDurationMs=Math.max(300, (wordCount/(wpm[lang]||150))*60000);
+    var estDurationMs=Math.max(300, (wordCount/(wpm[lang]||150))*60000) * ANDROID_ESTIMATE_SLOWDOWN;
     function advanceTo(i){ if(i>chunk.boundaryIdx){ chunk.boundaryIdx=i; updateSegHighlight(lang, base+i); } }
     var estTimer=setInterval(function(){
       if(activeChunk!==chunk || chunk.hasRealBoundary){ clearInterval(estTimer); return; } // real events showed up — stand down for good
@@ -1033,20 +1043,34 @@
     renderBlock();
     onPlaybackStateChanged();
   }
-  // Pause at the EXACT spot — mid-word-boundary for real TTS (see
-  // speakChunk), or mid-countdown for the no-speech-engine timed fallback —
-  // and resume picks up right there rather than restarting the block. Only
-  // updates the play/pause icon (not a full renderBlock) so an in-progress
-  // scroll position isn't reset out from under the person mid-pause.
+  // Pause at the exact spot for engines with real word-boundary support
+  // (e.g. iOS) — mid-countdown for the no-speech-engine timed fallback —
+  // and resume picks up right there rather than restarting the block. For
+  // engines where we only have the time-ESTIMATED position (mainly
+  // Android — see speakChunk/hasRealBoundary), resuming at that estimate
+  // risks skipping words if it ran slightly ahead of the real audio; there,
+  // resume instead backs up to the START of the previous full sentence —
+  // repeating a little rather than ever skipping — or the very start of the
+  // block if we were still in its first sentence. Only updates the
+  // play/pause icon (not a full renderBlock) so an in-progress scroll
+  // position isn't reset out from under the person mid-pause.
   function pauseReading(){
     if(!playing || paused) return;
     paused=true;
     if(hasTTS && activeChunk){
       var chunk=activeChunk; activeChunk=null;
-      var sliceStart=chunk.boundaryIdx||0;
-      var remain=chunk.text.slice(sliceStart);
-      if(!remain){ remain=chunk.text; sliceStart=0; } // paused right at/after the end — just replay it on resume
-      pausedResume={ type:'tts', lang:chunk.lang, text:remain, base:chunk.base+sliceStart, onEnd:chunk.onEnd };
+      var seg = chunk.lang==='fr' ? frSeg : enSeg;
+      var fullText = seg ? seg.text : chunk.text;
+      var absoluteIdx = chunk.base + (chunk.boundaryIdx||0);
+      var resumeAbs = absoluteIdx;
+      if(!chunk.hasRealBoundary && seg && seg.boundaries){
+        var curSegIdx=segIndexForOffset(seg.boundaries, absoluteIdx);
+        var targetSegIdx=Math.max(0, curSegIdx-1);
+        resumeAbs=seg.boundaries[targetSegIdx];
+      }
+      var remain=fullText.slice(resumeAbs);
+      if(!remain){ remain=fullText; resumeAbs=0; } // paused right at/after the end — just replay it on resume
+      pausedResume={ type:'tts', lang:chunk.lang, text:remain, base:resumeAbs, onEnd:chunk.onEnd };
       try{ window.speechSynthesis.cancel(); }catch(e){}
       curLangPlaying=null; clearSegHighlight();
     } else if(fallbackDeadline!=null){
